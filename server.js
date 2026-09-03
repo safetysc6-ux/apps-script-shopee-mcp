@@ -63,7 +63,7 @@ app.get('/.well-known/oauth-authorization-server',(_req,res)=>res.json({
   issuer:BASE,
   authorization_endpoint:`${BASE}/oauth/authorize`,
   token_endpoint:`${BASE}/oauth/token`,
-  response_types_supported:['code'], grant_types_supported:['authorization_code'],
+  response_types_supported:['code'], grant_types_supported:['authorization_code','refresh_token'],
   token_endpoint_auth_methods_supported:['client_secret_post','client_secret_basic'],
   code_challenge_methods_supported:['S256','plain'], scopes_supported:['mcp']
 }));
@@ -90,12 +90,22 @@ app.post('/oauth/token',async(req,res)=>{
     const basic=req.get('authorization')||'';
     if(basic.startsWith('Basic ')){ const [u,p]=Buffer.from(basic.slice(6),'base64').toString('utf8').split(':'); clientId=u||clientId; clientSecret=p||clientSecret; }
     if(clientId!==process.env.SPARK_OAUTH_CLIENT_ID || clientSecret!==process.env.SPARK_OAUTH_CLIENT_SECRET) return res.status(401).json({error:'invalid_client'});
+
+    if(req.body.grant_type==='refresh_token'){
+      try{
+        const {payload}=await jwtVerify(req.body.refresh_token||'',signingKey(),{issuer:BASE,audience:`${BASE}/oauth/token`});
+        if(payload.typ!=='refresh_token' || payload.sub!==clientId) throw new Error('invalid refresh token');
+        return res.json({access_token:await mintAccessToken(clientId),token_type:'Bearer',expires_in:3600,scope:'mcp'});
+      }catch{return res.status(400).json({error:'invalid_grant'});}
+    }
+
     if(req.body.grant_type!=='authorization_code') return res.status(400).json({error:'unsupported_grant_type'});
     const rec=authCodes.get(req.body.code);
-    if(!rec || rec.expires<Date.now() || rec.client_id!==clientId || rec.redirect_uri!==req.body.redirect_uri) return res.status(400).json({error:'invalid_grant'});
+    if(!rec || rec.expires<Date.now() || rec.client_id!==clientId) return res.status(400).json({error:'invalid_grant'});
+    if(req.body.redirect_uri && rec.redirect_uri!==req.body.redirect_uri) return res.status(400).json({error:'invalid_grant'});
     if(rec.code_challenge){ const verifier=req.body.code_verifier||''; const actual=rec.code_challenge_method==='S256'?pkceS256(verifier):verifier; if(actual!==rec.code_challenge)return res.status(400).json({error:'invalid_grant',error_description:'PKCE verification failed'}); }
     authCodes.delete(req.body.code);
-    res.json({access_token:await mintAccessToken(clientId),token_type:'Bearer',expires_in:3600,scope:'mcp'});
+    res.json({access_token:await mintAccessToken(clientId),refresh_token:await mintRefreshToken(clientId),token_type:'Bearer',expires_in:3600,scope:'mcp'});
   }catch(e){res.status(500).json({error:'server_error',error_description:String(e.message||e)});}
 });
 
@@ -124,7 +134,7 @@ app.get('/health',async(_req,res)=>{
     res.json({ok:!!t.token,googleOauthConfigured:true,sparkOauthConfigured:sparkReady});
   }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
 });
-app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.0.0',sparkOAuth:true}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.1.0',sparkOAuth:true}));
 
 function parseCommission(data,targetDate){
   const h=data.headers;
@@ -425,7 +435,7 @@ function makeServer(){
   return server;
 }
 
-app.post('/mcp',requireMcpAuth,async(req,res)=>{
+async function handleMcp(req,res){
   try{
     const sid=req.get('mcp-session-id');
     let t=sid?sessions.get(sid):null;
@@ -440,7 +450,10 @@ app.post('/mcp',requireMcpAuth,async(req,res)=>{
     console.error(e);
     if(!res.headersSent) res.status(500).json({error:String(e.message||e)});
   }
-});
+}
+app.post('/mcp',requireMcpAuth,handleMcp);
+app.get('/mcp',requireMcpAuth,handleMcp);
+app.delete('/mcp',requireMcpAuth,handleMcp);
 
 const port=Number(process.env.PORT||10000);
 app.listen(port,'0.0.0.0',()=>console.log(`Server listening on ${port}`));
