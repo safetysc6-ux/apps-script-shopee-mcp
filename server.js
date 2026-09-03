@@ -163,7 +163,7 @@ app.get('/health',async(_req,res)=>{
     res.json({ok:!!t.token,googleOauthConfigured:true,sparkOauthConfigured:sparkReady});
   }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
 });
-app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.2.0',sparkOAuth:true}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.3.0',sparkOAuth:true,mobileDefaults:true}));
 
 function parseCommission(data,targetDate){
   const h=data.headers;
@@ -314,32 +314,55 @@ async function upsertDaily(spreadsheetId,sheetName,obj){
 }
 
 function makeServer(){
-  const server=new McpServer({name:'google-apps-script-sheets-shopee-manager',version:'4.2.0'});
+  const server=new McpServer({name:'google-apps-script-sheets-shopee-manager',version:'4.3.0'});
 
-  // --- Existing Apps Script / Sheets / Drive basics ---
+  // --- Apps Script tools optimized for Spark/mobile ---
+  // scriptId is optional. If omitted, the server automatically uses ALLOWED_SCRIPT_ID.
+  // This avoids forcing Gemini/Spark to know or repeat the Apps Script project ID.
+  function resolveScriptId(inputId){
+    const configured=(process.env.ALLOWED_SCRIPT_ID||'').trim();
+    const resolved=(inputId||configured||'').trim();
+    if(!resolved) throw new Error('No Apps Script project configured. Set ALLOWED_SCRIPT_ID in Render or provide scriptId.');
+    assertAllowedScript(resolved);
+    return resolved;
+  }
+  function inferAppsScriptType(name,type){
+    if(type) return type;
+    const n=String(name||'').toLowerCase();
+    if(n==='appsscript.json' || n.endsWith('.json')) return 'JSON';
+    if(n.endsWith('.html')) return 'HTML';
+    return 'SERVER_JS';
+  }
+
   server.registerTool('apps_script_get_content',{
-    description:'Read all source files from an Apps Script project.',
-    inputSchema:{scriptId:z.string().min(10)}
+    description:'Read all source files from the configured Apps Script project. On mobile/Spark, omit scriptId and the server automatically uses ALLOWED_SCRIPT_ID from Render.',
+    inputSchema:{scriptId:z.string().min(10).optional()}
   },async({scriptId})=>{
-    assertAllowedScript(scriptId);
-    const r=await scriptApi().projects.getContent({scriptId});
-    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+    const resolvedScriptId=resolveScriptId(scriptId);
+    const r=await scriptApi().projects.getContent({scriptId:resolvedScriptId});
+    return {content:[{type:'text',text:JSON.stringify({scriptId:resolvedScriptId,files:r.data.files||[]},null,2)}]};
   });
 
   server.registerTool('apps_script_update_file_safe',{
-    description:'Backup current HEAD, then update/add one Apps Script file while preserving all other files.',
-    inputSchema:{scriptId:z.string().min(10),name:z.string().min(1),type:z.enum(['SERVER_JS','HTML','JSON']),source:z.string()}
+    description:'Safely update or add one file in the configured Apps Script project. The server automatically uses ALLOWED_SCRIPT_ID when scriptId is omitted, creates a backup version first, and preserves every other file. type is optional and inferred from the file name.',
+    inputSchema:{
+      scriptId:z.string().min(10).optional(),
+      name:z.string().min(1),
+      type:z.enum(['SERVER_JS','HTML','JSON']).optional(),
+      source:z.string()
+    }
   },async({scriptId,name,type,source})=>{
-    assertAllowedScript(scriptId);
+    const resolvedScriptId=resolveScriptId(scriptId);
+    const resolvedType=inferAppsScriptType(name,type);
     const api=scriptApi();
-    const backup=await api.projects.versions.create({scriptId,requestBody:{description:`Backup before ${name}`}});
-    const cur=await api.projects.getContent({scriptId});
+    const backup=await api.projects.versions.create({scriptId:resolvedScriptId,requestBody:{description:`Backup before ${name}`}});
+    const cur=await api.projects.getContent({scriptId:resolvedScriptId});
     const files=[...(cur.data.files||[])];
     const i=files.findIndex(f=>f.name===name);
-    const next={name,type,source};
+    const next={name,type:resolvedType,source};
     if(i>=0) files[i]=next; else files.push(next);
-    await api.projects.updateContent({scriptId,requestBody:{files}});
-    return {content:[{type:'text',text:`Backup v${backup.data.versionNumber}; updated ${name}`}]};
+    await api.projects.updateContent({scriptId:resolvedScriptId,requestBody:{files}});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:resolvedScriptId,backupVersion:backup.data.versionNumber,updatedFile:name,type:resolvedType,preservedOtherFiles:true},null,2)}]};
   });
 
   server.registerTool('sheets_get_range',{

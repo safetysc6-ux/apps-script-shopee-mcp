@@ -1,38 +1,55 @@
-# v4.2 Spark OAuth Debug Fix
+# Apps Script + Sheets + Shopee MCP v4.3 — Spark Mobile Fix
 
-Changes:
-- Fixes missing `mintRefreshToken()` that could make `/oauth/token` return HTTP 500 after consent.
-- Adds safe HTTP/OAuth/MCP request logging for Render Logs.
-- Logs only route/status and boolean checks; it does **not** print bearer tokens, client secrets, authorization codes, refresh tokens, or query values.
+Version 4.3 keeps the Spark OAuth/debug fixes from v4.2 and makes Apps Script editing easier from Gemini/Spark on mobile.
 
-After deploy, retry the Spark connection and inspect Render Logs for `[OAUTH ...]`, `[MCP AUTH]`, and `[HTTP]` lines.
+## What changed in v4.3
 
----
+- `apps_script_get_content` no longer requires `scriptId`.
+- `apps_script_update_file_safe` no longer requires `scriptId`.
+- Both tools automatically use `ALLOWED_SCRIPT_ID` from Render when `scriptId` is omitted.
+- `type` is optional when updating a file:
+  - `.html` -> `HTML`
+  - `.json` / `appsscript.json` -> `JSON`
+  - everything else -> `SERVER_JS`
+- Every Apps Script update still creates a backup version first and preserves all other project files.
+- Keeps v4.2 safe HTTP/OAuth/MCP debug logging without printing secrets/tokens.
 
-# Apps Script + Sheets + Shopee MCP v4 — Spark OAuth
+## Required Render variable
 
-เพิ่ม OAuth สำหรับ **Spark → MCP** แยกจาก Google OAuth เดิม
+Make sure this already exists:
 
-## Render Environment ใหม่
-```env
-PUBLIC_BASE_URL=https://apps-script-shopee-mcp.onrender.com
-SPARK_OAUTH_CLIENT_ID=ตั้งเอง เช่น spark-mcp-client
-SPARK_OAUTH_CLIENT_SECRET=สุ่มยาวๆ
-SPARK_REDIRECT_URI=คัดลอก URL การเปลี่ยนเส้นทางจาก Spark มาใส่ตรงนี้
-SPARK_TOKEN_SIGNING_SECRET=สุ่มยาวอย่างน้อย 32 ตัวอักษร
+```text
+ALLOWED_SCRIPT_ID=<your Apps Script Script ID from Project Settings>
 ```
 
-> `SPARK_OAUTH_CLIENT_ID/SECRET` ไม่ใช่ Google OAuth Client ID/Secret
+Do not paste the Script ID into Gemini prompts after this. The server resolves it automatically.
 
-## ในหน้า Spark
-- MCP URL: `https://apps-script-shopee-mcp.onrender.com/mcp`
-- OAuth Client ID: ค่า `SPARK_OAUTH_CLIENT_ID`
-- OAuth Client Secret: ค่า `SPARK_OAUTH_CLIENT_SECRET`
-- กด “คัดลอก URL การเปลี่ยนเส้นทาง” แล้วนำไปใส่ Render เป็น `SPARK_REDIRECT_URI`
+## Deploy
 
-จากนั้น Save/Redeploy Render แล้วเชื่อมใหม่
+1. Extract this ZIP.
+2. Upload/replace these files in the existing GitHub repository.
+3. Commit.
+4. Wait for Render auto-deploy.
+5. Open the root URL and confirm `version` is `4.3.0`.
+6. `/health` should still show both Google OAuth and Spark OAuth configured.
+7. In Gemini/Spark, disconnect/reconnect the custom app if the old tool schema is cached.
 
-## Health
-`https://apps-script-shopee-mcp.onrender.com/health` ควรเห็น `googleOauthConfigured:true` และ `sparkOauthConfigured:true`
+## Example mobile prompts
 
-Google OAuth เดิม (`/auth/start`, `/oauth2callback`) ยังคงใช้สำหรับ MCP → Google API เหมือนเดิม
+Read code:
+
+```text
+อ่าน Apps Script ปัจจุบันของฉัน แล้วสรุปว่าแต่ละไฟล์ทำอะไร ยังไม่ต้องแก้ไข
+```
+
+Update Code.gs:
+
+```text
+อ่าน Apps Script ปัจจุบันก่อน แล้วแก้ Code.gs ให้เพิ่มฟังก์ชันสรุปยอดรายวัน โดยเก็บโค้ดเดิมและฟังก์ชันเดิมทั้งหมดไว้ จากนั้นบอกว่าปรับอะไรไปบ้าง
+```
+
+Create/update HTML:
+
+```text
+แก้ Index.html ใน Apps Script ให้เพิ่มปุ่ม Refresh โดยห้ามลบส่วนเดิม และสำรองเวอร์ชันก่อนแก้
+```
