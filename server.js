@@ -5,7 +5,7 @@ import { SignJWT, jwtVerify } from 'jose';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { oauthClient,scriptApi,sheetsApi,driveApi,assertAllowedScript,assertAllowedSheet } from './google.js';
+import { oauthClient,scriptApi,sheetsApi,driveApi,assertAllowedScript,assertAllowedSheet,scriptAccessMode } from './google.js';
 import {
   parseCsvDrive,findIndex,findLatestInFolder,dateOnly,num,normalizeSub,dayDiff,
   round2,uniqueCount,sumRows
@@ -13,6 +13,7 @@ import {
 
 const app=express();
 app.use(express.json({limit:'16mb'}));
+app.use('/assets',express.static('public'));
 app.use(express.urlencoded({extended:false}));
 
 // Safe request logger: never prints Authorization headers, tokens, secrets, codes, or query values.
@@ -155,6 +156,173 @@ app.get('/oauth2callback',async(req,res)=>{
   }catch(e){res.status(500).send('OAuth failed: '+String(e.message||e));}
 });
 
+
+
+// ===== v4.5 Web Tool / Chat Console =====
+function requireWebAdmin(req,res,next){
+  const expected=(process.env.WEB_ADMIN_TOKEN||'').trim();
+  if(!expected) return res.status(503).json({ok:false,error:'WEB_ADMIN_TOKEN is not configured'});
+  const h=req.get('authorization')||'';
+  const token=h.startsWith('Bearer ')?h.slice(7):'';
+  if(token!==expected) return res.status(401).json({ok:false,error:'Unauthorized'});
+  next();
+}
+function webResolveScriptId(inputId){
+  const configured=(process.env.ALLOWED_SCRIPT_ID||'').trim();
+  const id=String(inputId||configured||'').trim();
+  if(!id) throw new Error('No Apps Script project selected');
+  assertAllowedScript(id);
+  return id;
+}
+function webInferType(name,type){
+  if(type) return type;
+  const n=String(name||'').toLowerCase();
+  if(n==='appsscript.json'||n.endsWith('.json')) return 'JSON';
+  if(n.endsWith('.html')) return 'HTML';
+  return 'SERVER_JS';
+}
+function webFileName(name){
+  const n=String(name||'').trim();
+  if(!n) throw new Error('File name is required');
+  return n.replace(/\.(gs|html)$/i,'');
+}
+async function webGetProjectContent(scriptId){
+  const id=webResolveScriptId(scriptId);
+  const [meta,content]=await Promise.all([
+    scriptApi().projects.get({scriptId:id}),
+    scriptApi().projects.getContent({scriptId:id})
+  ]);
+  return {project:meta.data,files:content.data.files||[]};
+}
+async function webWriteFiles(scriptId,files,{backup=true}={}){
+  const id=webResolveScriptId(scriptId), api=scriptApi();
+  let backupVersion=null;
+  if(backup){
+    const v=await api.projects.versions.create({scriptId:id,requestBody:{description:'Web Tool backup before edit'}});
+    backupVersion=v.data.versionNumber;
+  }
+  const current=(await api.projects.getContent({scriptId:id})).data.files||[];
+  for(const f of files){
+    const name=webFileName(f.name), type=webInferType(f.name,f.type), source=String(f.source??'');
+    const i=current.findIndex(x=>x.name===name);
+    const next={name,type,source};
+    if(i>=0) current[i]=next; else current.push(next);
+  }
+  await api.projects.updateContent({scriptId:id,requestBody:{files:current}});
+  return {ok:true,scriptId:id,backupVersion,filesWritten:files.map(f=>webFileName(f.name))};
+}
+async function webFindProjects(nameContains=''){
+  const clauses=["mimeType='application/vnd.google-apps.script'","trashed=false"];
+  if(nameContains){ const safe=String(nameContains).replace(/'/g,"\\'"); clauses.push(`name contains '${safe}'`); }
+  const r=await driveApi().files.list({q:clauses.join(' and '),pageSize:100,orderBy:'modifiedTime desc',fields:'files(id,name,mimeType,modifiedTime,createdTime,webViewLink,parents)'});
+  return r.data.files||[];
+}
+
+app.get('/tool',(_req,res)=>res.sendFile(process.cwd()+'/public/admin.html'));
+app.get('/tool/',(_req,res)=>res.sendFile(process.cwd()+'/public/admin.html'));
+
+app.get('/api/admin/status',requireWebAdmin,async(_req,res)=>{
+  try{
+    res.json({ok:true,version:'4.5.0',scriptAccessMode:scriptAccessMode(),geminiConfigured:!!process.env.GEMINI_API_KEY,defaultScriptId:(process.env.ALLOWED_SCRIPT_ID||'')?true:false});
+  }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
+});
+app.get('/api/admin/projects',requireWebAdmin,async(req,res)=>{
+  try{res.json({ok:true,projects:await webFindProjects(req.query.q||'')});}
+  catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
+});
+app.post('/api/admin/projects',requireWebAdmin,async(req,res)=>{
+  try{
+    const title=String(req.body.title||'').trim(); if(!title) return res.status(400).json({ok:false,error:'title required'});
+    const requestBody={title}; if(req.body.parentId) requestBody.parentId=String(req.body.parentId);
+    const r=await scriptApi().projects.create({requestBody});
+    res.json({ok:true,project:r.data,note:scriptAccessMode()==='all'?'Ready to edit':'If access mode is locked, add the new scriptId to ALLOWED_SCRIPT_IDS.'});
+  }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
+});
+app.get('/api/admin/projects/:scriptId',requireWebAdmin,async(req,res)=>{
+  try{res.json({ok:true,...await webGetProjectContent(req.params.scriptId)});}
+  catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
+});
+app.put('/api/admin/projects/:scriptId/files',requireWebAdmin,async(req,res)=>{
+  try{
+    const files=Array.isArray(req.body.files)?req.body.files:[];
+    if(!files.length) return res.status(400).json({ok:false,error:'files[] required'});
+    res.json(await webWriteFiles(req.params.scriptId,files,{backup:req.body.backup!==false}));
+  }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
+});
+app.post('/api/admin/projects/:scriptId/version',requireWebAdmin,async(req,res)=>{
+  try{
+    const id=webResolveScriptId(req.params.scriptId);
+    const r=await scriptApi().projects.versions.create({scriptId:id,requestBody:{description:String(req.body.description||'Created from Web Tool')}});
+    res.json({ok:true,version:r.data});
+  }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
+});
+app.get('/api/admin/projects/:scriptId/deployments',requireWebAdmin,async(req,res)=>{
+  try{
+    const id=webResolveScriptId(req.params.scriptId);
+    const r=await scriptApi().projects.deployments.list({scriptId:id,pageSize:100});
+    res.json({ok:true,deployments:r.data.deployments||[]});
+  }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
+});
+
+function extractJsonObject(text){
+  const clean=String(text||'').replace(/^```json\s*/i,'').replace(/```$/,'').trim();
+  try{return JSON.parse(clean);}catch{}
+  const a=clean.indexOf('{'), b=clean.lastIndexOf('}');
+  if(a>=0&&b>a) return JSON.parse(clean.slice(a,b+1));
+  throw new Error('AI returned invalid JSON');
+}
+async function callGeminiPlanner({message,scriptId,context}){
+  const key=(process.env.GEMINI_API_KEY||'').trim();
+  if(!key) throw new Error('GEMINI_API_KEY is not configured. Add it in Render Environment to use free-text AI chat.');
+  const model=(process.env.GEMINI_MODEL||'gemini-2.5-flash').trim();
+  const sys=`You are the controller for a private Google Apps Script web tool. Convert the Thai or English user request into ONE JSON object only. Never use markdown.\nAllowed actions:\n- {"action":"reply","reply":"..."}\n- {"action":"list_projects","query":""}\n- {"action":"read_project","scriptId":"optional"}\n- {"action":"create_project","title":"...","parentId":"optional","files":[{"name":"Code.gs","source":"..."}]}\n- {"action":"write_files","scriptId":"optional","files":[{"name":"Code.gs|Index.html|appsscript.json","source":"full source"}],"reply":"summary"}\n- {"action":"create_version","scriptId":"optional","description":"..."}\nWhen asked to build or modify code, output complete production-ready source for every file you change. Preserve existing functions unless user explicitly asks to replace them. If current project source is provided, base edits on it. Do not invent script IDs; use selectedScriptId by leaving scriptId empty when appropriate.`;
+  const userPayload={message,selectedScriptId:scriptId||null,currentProject:context||null};
+  const url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
+  const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:sys}]},contents:[{role:'user',parts:[{text:JSON.stringify(userPayload)}]}],generationConfig:{temperature:0.2,responseMimeType:'application/json'}})});
+  const data=await r.json();
+  if(!r.ok) throw new Error(data?.error?.message||`Gemini HTTP ${r.status}`);
+  const text=(data.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
+  return extractJsonObject(text);
+}
+app.post('/api/admin/chat',requireWebAdmin,async(req,res)=>{
+  try{
+    const message=String(req.body.message||'').trim();
+    if(!message) return res.status(400).json({ok:false,error:'message required'});
+    const selectedScriptId=String(req.body.scriptId||'').trim();
+    let context=null;
+    if(selectedScriptId){
+      try{context=await webGetProjectContent(selectedScriptId);}catch(e){context={error:String(e.message||e)};}
+    }
+    const plan=await callGeminiPlanner({message,scriptId:selectedScriptId,context});
+    let result=null;
+    if(plan.action==='reply') result={reply:plan.reply||''};
+    else if(plan.action==='list_projects') result={projects:await webFindProjects(plan.query||'')};
+    else if(plan.action==='read_project') result=await webGetProjectContent(plan.scriptId||selectedScriptId);
+    else if(plan.action==='create_project'){
+      const requestBody={title:String(plan.title||'New Apps Script Project')}; if(plan.parentId)requestBody.parentId=String(plan.parentId);
+      const cr=await scriptApi().projects.create({requestBody});
+      result={project:cr.data};
+      if(Array.isArray(plan.files)&&plan.files.length){
+        if(scriptAccessMode()!=='all') throw new Error(`Project created (${cr.data.scriptId}) but SCRIPT_ACCESS_MODE is locked. Set SCRIPT_ACCESS_MODE=all or allow this ID before writing.`);
+        result.write=await webWriteFiles(cr.data.scriptId,plan.files,{backup:false});
+      }
+    } else if(plan.action==='write_files'){
+      const id=plan.scriptId||selectedScriptId;
+      if(!id) throw new Error('Select a project first');
+      result=await webWriteFiles(id,plan.files||[],{backup:true});
+      result.reply=plan.reply||'บันทึกไฟล์เรียบร้อย';
+    } else if(plan.action==='create_version'){
+      const id=webResolveScriptId(plan.scriptId||selectedScriptId);
+      const vr=await scriptApi().projects.versions.create({scriptId:id,requestBody:{description:String(plan.description||'Created from Web Tool Chat')}});
+      result={version:vr.data};
+    } else throw new Error(`Unsupported AI action: ${plan.action}`);
+    res.json({ok:true,plan,result});
+  }catch(e){
+    console.error('[WEB CHAT ERROR]',String(e.message||e));
+    res.status(500).json({ok:false,error:String(e.message||e)});
+  }
+});
+
 app.get('/health',async(_req,res)=>{
   try{
     const sparkReady=!!(BASE&&process.env.SPARK_OAUTH_CLIENT_ID&&process.env.SPARK_OAUTH_CLIENT_SECRET&&process.env.SPARK_REDIRECT_URI&&process.env.SPARK_TOKEN_SIGNING_SECRET);
@@ -163,7 +331,7 @@ app.get('/health',async(_req,res)=>{
     res.json({ok:!!t.token,googleOauthConfigured:true,sparkOauthConfigured:sparkReady});
   }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
 });
-app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.3.0',sparkOAuth:true,mobileDefaults:true}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.5.0',sparkOAuth:true,mobileDefaults:true}));
 
 function parseCommission(data,targetDate){
   const h=data.headers;
@@ -314,15 +482,16 @@ async function upsertDaily(spreadsheetId,sheetName,obj){
 }
 
 function makeServer(){
-  const server=new McpServer({name:'google-apps-script-sheets-shopee-manager',version:'4.3.0'});
+  const server=new McpServer({name:'google-apps-script-sheets-shopee-manager',version:'4.5.0'});
 
-  // --- Apps Script tools optimized for Spark/mobile ---
-  // scriptId is optional. If omitted, the server automatically uses ALLOWED_SCRIPT_ID.
-  // This avoids forcing Gemini/Spark to know or repeat the Apps Script project ID.
+  // --- Apps Script full-control tools optimized for Spark/mobile ---
+  // Security modes:
+  // SCRIPT_ACCESS_MODE=locked (default): only ALLOWED_SCRIPT_ID / ALLOWED_SCRIPT_IDS.
+  // SCRIPT_ACCESS_MODE=all: any Apps Script project accessible by the Google OAuth account.
   function resolveScriptId(inputId){
     const configured=(process.env.ALLOWED_SCRIPT_ID||'').trim();
     const resolved=(inputId||configured||'').trim();
-    if(!resolved) throw new Error('No Apps Script project configured. Set ALLOWED_SCRIPT_ID in Render or provide scriptId.');
+    if(!resolved) throw new Error('No Apps Script project selected. Provide scriptId, set ALLOWED_SCRIPT_ID, or use apps_script_create_project first.');
     assertAllowedScript(resolved);
     return resolved;
   }
@@ -333,9 +502,33 @@ function makeServer(){
     if(n.endsWith('.html')) return 'HTML';
     return 'SERVER_JS';
   }
+  function normalizeScriptFileName(name){
+    const n=String(name||'').trim();
+    if(!n) throw new Error('File name is required');
+    return n.replace(/\.(gs|html)$/i,'');
+  }
+  async function getProjectFiles(scriptId){
+    const api=scriptApi();
+    const r=await api.projects.getContent({scriptId});
+    return r.data.files||[];
+  }
+  async function backupProject(scriptId,description){
+    const api=scriptApi();
+    const r=await api.projects.versions.create({scriptId,requestBody:{description:description||'MCP backup'}});
+    return r.data.versionNumber;
+  }
+
+  server.registerTool('apps_script_create_project',{
+    description:'CREATE a new Google Apps Script project directly. Use this whenever the user asks to create a new Apps Script project. parentId is optional; omit it for a standalone project, or provide a Google Sheet/Doc/Form Drive file ID to create a container-bound project when Google permits it. Returns the new scriptId.',
+    inputSchema:{title:z.string().min(1),parentId:z.string().min(10).optional()}
+  },async({title,parentId})=>{
+    const requestBody={title}; if(parentId) requestBody.parentId=parentId;
+    const r=await scriptApi().projects.create({requestBody});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,project:r.data,accessMode:scriptAccessMode(),note:'Use the returned scriptId for subsequent tools. If SCRIPT_ACCESS_MODE is locked, add this scriptId to ALLOWED_SCRIPT_IDS before editing it.'},null,2)}]};
+  });
 
   server.registerTool('apps_script_get_content',{
-    description:'Read all source files from the configured Apps Script project. On mobile/Spark, omit scriptId and the server automatically uses ALLOWED_SCRIPT_ID from Render.',
+    description:'READ all source files in an Apps Script project. If scriptId is omitted, uses ALLOWED_SCRIPT_ID. Returns exact current source so the model can inspect before editing.',
     inputSchema:{scriptId:z.string().min(10).optional()}
   },async({scriptId})=>{
     const resolvedScriptId=resolveScriptId(scriptId);
@@ -343,26 +536,156 @@ function makeServer(){
     return {content:[{type:'text',text:JSON.stringify({scriptId:resolvedScriptId,files:r.data.files||[]},null,2)}]};
   });
 
-  server.registerTool('apps_script_update_file_safe',{
-    description:'Safely update or add one file in the configured Apps Script project. The server automatically uses ALLOWED_SCRIPT_ID when scriptId is omitted, creates a backup version first, and preserves every other file. type is optional and inferred from the file name.',
-    inputSchema:{
-      scriptId:z.string().min(10).optional(),
-      name:z.string().min(1),
-      type:z.enum(['SERVER_JS','HTML','JSON']).optional(),
-      source:z.string()
-    }
-  },async({scriptId,name,type,source})=>{
-    const resolvedScriptId=resolveScriptId(scriptId);
-    const resolvedType=inferAppsScriptType(name,type);
-    const api=scriptApi();
-    const backup=await api.projects.versions.create({scriptId:resolvedScriptId,requestBody:{description:`Backup before ${name}`}});
-    const cur=await api.projects.getContent({scriptId:resolvedScriptId});
-    const files=[...(cur.data.files||[])];
-    const i=files.findIndex(f=>f.name===name);
-    const next={name,type:resolvedType,source};
+  server.registerTool('apps_script_get_project',{
+    description:'GET Apps Script project metadata such as title, scriptId, parentId and createTime/updateTime.',
+    inputSchema:{scriptId:z.string().min(10).optional()}
+  },async({scriptId})=>{
+    const id=resolveScriptId(scriptId);
+    const r=await scriptApi().projects.get({scriptId:id});
+    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+  });
+
+  server.registerTool('apps_script_write_file',{
+    description:'CREATE or REPLACE one .gs, .html or appsscript.json file directly inside an Apps Script project. Preserves all other files and creates a backup version first. Use this tool instead of creating a Drive document when the user asks to write Apps Script code.',
+    inputSchema:{scriptId:z.string().min(10).optional(),name:z.string().min(1),type:z.enum(['SERVER_JS','HTML','JSON']).optional(),source:z.string(),backup:z.boolean().optional()}
+  },async({scriptId,name,type,source,backup})=>{
+    const id=resolveScriptId(scriptId), api=scriptApi();
+    const resolvedType=inferAppsScriptType(name,type), fileName=normalizeScriptFileName(name);
+    const backupVersion=(backup===false)?null:await backupProject(id,`Backup before writing ${fileName}`);
+    const files=await getProjectFiles(id);
+    const i=files.findIndex(f=>f.name===fileName);
+    const next={name:fileName,type:resolvedType,source};
     if(i>=0) files[i]=next; else files.push(next);
-    await api.projects.updateContent({scriptId:resolvedScriptId,requestBody:{files}});
-    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:resolvedScriptId,backupVersion:backup.data.versionNumber,updatedFile:name,type:resolvedType,preservedOtherFiles:true},null,2)}]};
+    await api.projects.updateContent({scriptId:id,requestBody:{files}});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:id,file:fileName,type:resolvedType,created:i<0,replaced:i>=0,backupVersion},null,2)}]};
+  });
+
+  // Backward-compatible tool name retained for existing Spark configurations.
+  server.registerTool('apps_script_update_file_safe',{
+    description:'Safely CREATE or UPDATE one file in Apps Script directly. Equivalent to apps_script_write_file; preserves all other files and makes a backup version first.',
+    inputSchema:{scriptId:z.string().min(10).optional(),name:z.string().min(1),type:z.enum(['SERVER_JS','HTML','JSON']).optional(),source:z.string()}
+  },async({scriptId,name,type,source})=>{
+    const id=resolveScriptId(scriptId), api=scriptApi();
+    const resolvedType=inferAppsScriptType(name,type), fileName=normalizeScriptFileName(name);
+    const backupVersion=await backupProject(id,`Backup before ${fileName}`);
+    const files=await getProjectFiles(id); const i=files.findIndex(f=>f.name===fileName);
+    const next={name:fileName,type:resolvedType,source}; if(i>=0) files[i]=next; else files.push(next);
+    await api.projects.updateContent({scriptId:id,requestBody:{files}});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:id,backupVersion,updatedFile:fileName,type:resolvedType,preservedOtherFiles:true},null,2)}]};
+  });
+
+  server.registerTool('apps_script_delete_file',{
+    description:'DELETE one source file from an Apps Script project. Creates a backup version first and preserves all remaining files.',
+    inputSchema:{scriptId:z.string().min(10).optional(),name:z.string().min(1)}
+  },async({scriptId,name})=>{
+    const id=resolveScriptId(scriptId), api=scriptApi(), fileName=normalizeScriptFileName(name);
+    const backupVersion=await backupProject(id,`Backup before deleting ${fileName}`);
+    const files=await getProjectFiles(id); const next=files.filter(f=>f.name!==fileName);
+    if(next.length===files.length) throw new Error(`Apps Script file not found: ${fileName}`);
+    if(next.length===0) throw new Error('Refusing to delete the final file in the project');
+    await api.projects.updateContent({scriptId:id,requestBody:{files:next}});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:id,deletedFile:fileName,backupVersion},null,2)}]};
+  });
+
+  server.registerTool('apps_script_rename_file',{
+    description:'RENAME an Apps Script source file without changing its source. Creates a backup version first.',
+    inputSchema:{scriptId:z.string().min(10).optional(),oldName:z.string().min(1),newName:z.string().min(1)}
+  },async({scriptId,oldName,newName})=>{
+    const id=resolveScriptId(scriptId), api=scriptApi();
+    const oldN=normalizeScriptFileName(oldName), newN=normalizeScriptFileName(newName);
+    const backupVersion=await backupProject(id,`Backup before renaming ${oldN} to ${newN}`);
+    const files=await getProjectFiles(id);
+    if(files.some(f=>f.name===newN)) throw new Error(`Target file already exists: ${newN}`);
+    const f=files.find(x=>x.name===oldN); if(!f) throw new Error(`Apps Script file not found: ${oldN}`);
+    f.name=newN; await api.projects.updateContent({scriptId:id,requestBody:{files}});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:id,oldName:oldN,newName:newN,backupVersion},null,2)}]};
+  });
+
+  server.registerTool('apps_script_replace_project_content',{
+    description:'REPLACE the entire Apps Script project content with the provided files. This can create/update/delete multiple files in one operation. A backup version is created first. Use only when the user explicitly wants a full-project rewrite.',
+    inputSchema:{scriptId:z.string().min(10).optional(),files:z.array(z.object({name:z.string().min(1),type:z.enum(['SERVER_JS','HTML','JSON']).optional(),source:z.string()})).min(1)}
+  },async({scriptId,files})=>{
+    const id=resolveScriptId(scriptId), api=scriptApi();
+    const backupVersion=await backupProject(id,'Backup before full project replacement');
+    const normalized=files.map(f=>({name:normalizeScriptFileName(f.name),type:inferAppsScriptType(f.name,f.type),source:f.source}));
+    await api.projects.updateContent({scriptId:id,requestBody:{files:normalized}});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:id,replacedEntireProject:true,fileCount:normalized.length,backupVersion},null,2)}]};
+  });
+
+  server.registerTool('apps_script_create_version',{
+    description:'CREATE an immutable Apps Script version from the current code.',
+    inputSchema:{scriptId:z.string().min(10).optional(),description:z.string().optional()}
+  },async({scriptId,description})=>{
+    const id=resolveScriptId(scriptId);
+    const r=await scriptApi().projects.versions.create({scriptId:id,requestBody:{description:description||'Created by MCP'}});
+    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+  });
+
+  server.registerTool('apps_script_list_versions',{
+    description:'LIST Apps Script project versions.',
+    inputSchema:{scriptId:z.string().min(10).optional(),pageSize:z.number().int().min(1).max(200).optional(),pageToken:z.string().optional()}
+  },async({scriptId,pageSize,pageToken})=>{
+    const id=resolveScriptId(scriptId);
+    const r=await scriptApi().projects.versions.list({scriptId:id,pageSize:pageSize||50,pageToken});
+    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+  });
+
+  server.registerTool('apps_script_list_deployments',{
+    description:'LIST deployments for an Apps Script project.',
+    inputSchema:{scriptId:z.string().min(10).optional(),pageSize:z.number().int().min(1).max(200).optional(),pageToken:z.string().optional()}
+  },async({scriptId,pageSize,pageToken})=>{
+    const id=resolveScriptId(scriptId);
+    const r=await scriptApi().projects.deployments.list({scriptId:id,pageSize:pageSize||50,pageToken});
+    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+  });
+
+  server.registerTool('apps_script_create_deployment',{
+    description:'CREATE a deployment for an Apps Script version. versionNumber must already exist.',
+    inputSchema:{scriptId:z.string().min(10).optional(),versionNumber:z.number().int().positive(),description:z.string().optional(),manifestFileName:z.string().optional()}
+  },async({scriptId,versionNumber,description,manifestFileName})=>{
+    const id=resolveScriptId(scriptId);
+    const requestBody={versionNumber,description:description||'Created by MCP'};
+    if(manifestFileName) requestBody.manifestFileName=manifestFileName;
+    const r=await scriptApi().projects.deployments.create({scriptId:id,requestBody});
+    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+  });
+
+  server.registerTool('apps_script_update_deployment',{
+    description:'UPDATE an existing Apps Script deployment to a different version/description.',
+    inputSchema:{scriptId:z.string().min(10).optional(),deploymentId:z.string().min(1),versionNumber:z.number().int().positive(),description:z.string().optional(),manifestFileName:z.string().optional()}
+  },async({scriptId,deploymentId,versionNumber,description,manifestFileName})=>{
+    const id=resolveScriptId(scriptId);
+    const requestBody={versionNumber}; if(description!==undefined) requestBody.description=description; if(manifestFileName) requestBody.manifestFileName=manifestFileName;
+    const r=await scriptApi().projects.deployments.update({scriptId:id,deploymentId,requestBody});
+    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+  });
+
+  server.registerTool('apps_script_delete_deployment',{
+    description:'DELETE an Apps Script deployment. This does not delete project source code.',
+    inputSchema:{scriptId:z.string().min(10).optional(),deploymentId:z.string().min(1)}
+  },async({scriptId,deploymentId})=>{
+    const id=resolveScriptId(scriptId);
+    await scriptApi().projects.deployments.delete({scriptId:id,deploymentId});
+    return {content:[{type:'text',text:JSON.stringify({ok:true,scriptId:id,deletedDeploymentId:deploymentId},null,2)}]};
+  });
+
+  server.registerTool('apps_script_list_processes',{
+    description:'LIST recent executions/processes for an Apps Script project for debugging and monitoring.',
+    inputSchema:{scriptId:z.string().min(10).optional(),pageSize:z.number().int().min(1).max(50).optional(),pageToken:z.string().optional()}
+  },async({scriptId,pageSize,pageToken})=>{
+    const id=resolveScriptId(scriptId);
+    const r=await scriptApi().processes.listScriptProcesses({scriptId:id,pageSize:pageSize||50,pageToken});
+    return {content:[{type:'text',text:JSON.stringify(r.data,null,2)}]};
+  });
+
+  server.registerTool('apps_script_find_projects',{
+    description:'SEARCH Google Drive for Apps Script project files accessible to the connected Google account. Useful for discovering script IDs before editing. Does not modify anything.',
+    inputSchema:{nameContains:z.string().optional(),pageSize:z.number().int().min(1).max(100).optional()}
+  },async({nameContains,pageSize})=>{
+    const clauses=["mimeType='application/vnd.google-apps.script'","trashed=false"];
+    if(nameContains){ const safe=String(nameContains).replace(/'/g,"\\'"); clauses.push(`name contains '${safe}'`); }
+    const r=await driveApi().files.list({q:clauses.join(' and '),pageSize:pageSize||50,fields:'files(id,name,mimeType,modifiedTime,createdTime,webViewLink,parents)'});
+    return {content:[{type:'text',text:JSON.stringify({files:r.data.files||[]},null,2)}]};
   });
 
   server.registerTool('sheets_get_range',{

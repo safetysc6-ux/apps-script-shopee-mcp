@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Apps Script Control Center</title>
+  <link rel="stylesheet" href="/assets/admin.css" />
+</head>
+<body>
+  <div class="orb orb-a"></div><div class="orb orb-b"></div>
+  <div id="login" class="login-wrap">
+    <div class="login-card glass">
+      <div class="brand-mark">⚡</div>
+      <h1>Apps Script Control Center</h1>
+      <p>จัดการ Apps Script, Sheets และ Shopee ผ่านเว็บเดียว</p>
+      <label>WEB ADMIN TOKEN</label>
+      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="วาง WEB_ADMIN_TOKEN" />
+      <button id="loginBtn" class="btn primary">เข้าใช้งาน</button>
+      <div id="loginError" class="error"></div>
+    </div>
+  </div>
+
+  <div id="app" class="app hidden">
+    <aside class="sidebar glass">
+      <div class="brand"><div class="brand-mark small">⚡</div><div><strong>Script Tool</strong><span>v4.5</span></div></div>
+      <nav>
+        <button class="nav active" data-view="chat">💬 <span>AI Chat</span></button>
+        <button class="nav" data-view="projects">🧩 <span>Projects</span></button>
+        <button class="nav" data-view="editor">🧠 <span>Code Editor</span></button>
+        <button class="nav" data-view="deploy">🚀 <span>Versions & Deploy</span></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="status-pill"><span id="dot"></span><span id="statusText">Checking...</span></div>
+        <button id="logoutBtn" class="ghost">ออกจากระบบ</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar glass">
+        <div>
+          <div class="eyebrow">CURRENT PROJECT</div>
+          <select id="projectSelect"><option value="">— เลือก Apps Script —</option></select>
+        </div>
+        <div class="top-actions">
+          <button id="refreshProjects" class="icon-btn" title="Refresh">↻</button>
+          <button id="newProjectBtn" class="btn secondary">+ New Project</button>
+        </div>
+      </header>
+
+      <section id="view-chat" class="view active">
+        <div class="hero-card glass">
+          <div><span class="badge">AI CONTROL</span><h2>สั่งงาน Apps Script แบบแชท</h2><p>พูดเป็นภาษาปกติ เช่น “สร้าง Dashboard ใหม่”, “แก้ Code.gs”, “อ่านโค้ดก่อนแล้วปรับให้เร็วขึ้น”</p></div>
+          <div class="hero-glow">AI</div>
+        </div>
+        <div class="quick-grid">
+          <button class="quick" data-prompt="อ่านโค้ดทั้งหมดของโปรเจกต์นี้ แล้วสรุปโครงสร้างและหน้าที่ของแต่ละไฟล์">🔎 อ่านและสรุปโค้ด</button>
+          <button class="quick" data-prompt="ตรวจโค้ดโปรเจกต์นี้ หา bug และจุดที่ควรปรับปรุง แล้วแก้ให้โดยเก็บฟังก์ชันเดิมไว้">🛠 แก้ Bug</button>
+          <button class="quick" data-prompt="สร้างหน้า Dashboard สวยทันสมัยสำหรับมือถือ โดยใช้ Code.gs และ Index.html และบันทึกลงโปรเจกต์นี้">✨ สร้าง Dashboard</button>
+          <button class="quick" data-prompt="สร้าง version ใหม่ของโปรเจกต์นี้ พร้อมคำอธิบายว่า Web Tool snapshot">📦 Create Version</button>
+        </div>
+        <div class="chat-shell glass">
+          <div id="messages" class="messages">
+            <div class="msg assistant"><div class="avatar">⚡</div><div class="bubble">พร้อมแล้วครับ เลือกโปรเจกต์ด้านบน แล้วพิมพ์สิ่งที่ต้องการให้ทำได้เลย</div></div>
+          </div>
+          <div class="composer">
+            <textarea id="chatInput" rows="1" placeholder="เช่น แก้ Code.gs ให้ดึงข้อมูลจาก Sheet แล้วแสดง Dashboard..."></textarea>
+            <button id="sendBtn" class="send">➤</button>
+          </div>
+          <div class="hint">AI Chat ต้องตั้ง <b>GEMINI_API_KEY</b> ใน Render • ทุกการแก้โค้ดจะสำรองเวอร์ชันก่อน</div>
+        </div>
+      </section>
+
+      <section id="view-projects" class="view">
+        <div class="section-head"><div><h2>Apps Script Projects</h2><p>โปรเจกต์ทั้งหมดที่บัญชี Google นี้เข้าถึงได้</p></div><input id="projectSearch" placeholder="ค้นหาชื่อโปรเจกต์" /></div>
+        <div id="projectCards" class="project-grid"></div>
+      </section>
+
+      <section id="view-editor" class="view">
+        <div class="editor-layout glass">
+          <div class="file-panel"><div class="panel-title">FILES <button id="addFileBtn">＋</button></div><div id="fileList" class="file-list"></div></div>
+          <div class="code-panel"><div class="code-toolbar"><input id="fileName" placeholder="Code.gs"/><button id="saveFileBtn" class="btn primary smallbtn">Save</button></div><textarea id="codeEditor" spellcheck="false" placeholder="เลือกไฟล์หรือสร้างไฟล์ใหม่..."></textarea></div>
+        </div>
+      </section>
+
+      <section id="view-deploy" class="view">
+        <div class="two-col">
+          <div class="glass card"><h3>สร้าง Version</h3><p>Snapshot โค้ดปัจจุบันแบบ immutable</p><input id="versionDesc" placeholder="เช่น Release 1.2"/><button id="createVersionBtn" class="btn primary">Create Version</button><pre id="versionResult"></pre></div>
+          <div class="glass card"><div class="row"><h3>Deployments</h3><button id="loadDeployBtn" class="ghost">Refresh</button></div><div id="deployList" class="deploy-list"></div></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="newProjectDialog" class="modal glass">
+    <form method="dialog">
+      <h3>สร้าง Apps Script Project</h3>
+      <label>ชื่อโปรเจกต์</label><input id="newProjectTitle" placeholder="Affiliate Dashboard" />
+      <label>Parent ID <span>(ไม่ใส่ก็ได้)</span></label><input id="newProjectParent" placeholder="Google Sheet ID สำหรับ bound project" />
+      <div class="modal-actions"><button value="cancel" class="ghost">ยกเลิก</button><button id="createProjectConfirm" value="default" class="btn primary">สร้าง</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast"></div>
+  <script src="/assets/admin.js"></script>
+</body>
+</html>

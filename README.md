@@ -1,55 +1,56 @@
-# Apps Script + Sheets + Shopee MCP v4.3 — Spark Mobile Fix
+# Apps Script + Sheets + Shopee MCP v4.5 Web Tool
 
-Version 4.3 keeps the Spark OAuth/debug fixes from v4.2 and makes Apps Script editing easier from Gemini/Spark on mobile.
+Adds a mobile-friendly Web Tool / Chat console on top of v4.4 Full Apps Script Control.
 
-## What changed in v4.3
+## New page
 
-- `apps_script_get_content` no longer requires `scriptId`.
-- `apps_script_update_file_safe` no longer requires `scriptId`.
-- Both tools automatically use `ALLOWED_SCRIPT_ID` from Render when `scriptId` is omitted.
-- `type` is optional when updating a file:
-  - `.html` -> `HTML`
-  - `.json` / `appsscript.json` -> `JSON`
-  - everything else -> `SERVER_JS`
-- Every Apps Script update still creates a backup version first and preserves all other project files.
-- Keeps v4.2 safe HTTP/OAuth/MCP debug logging without printing secrets/tokens.
+`https://YOUR-RENDER-SERVICE.onrender.com/tool`
 
-## Required Render variable
+Features:
+- Beautiful responsive chat-style UI for mobile/desktop
+- Apps Script project browser
+- Read/edit/create `.gs`, `.html`, and `appsscript.json`
+- Automatic backup version before code writes
+- Create Apps Script projects
+- Create versions and inspect deployments
+- Optional Gemini-powered natural-language commands directly from the web page
+- Existing MCP, Google OAuth, Sheets, Drive and Shopee tools remain available
 
-Make sure this already exists:
+## Required Render environment for Web Tool
 
-```text
-ALLOWED_SCRIPT_ID=<your Apps Script Script ID from Project Settings>
+```
+WEB_ADMIN_TOKEN=<generate a long random secret>
 ```
 
-Do not paste the Script ID into Gemini prompts after this. The server resolves it automatically.
+Use that token to sign in to `/tool`.
+
+For free-text AI chat also add:
+
+```
+GEMINI_API_KEY=<your Google AI Gemini API key>
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+If you want the Web Tool to manage any Apps Script project accessible to the connected Google account:
+
+```
+SCRIPT_ACCESS_MODE=all
+```
+
+Keep all existing OAuth/MCP/Sheets/Shopee environment variables from v4.4.
+
+## Security
+
+- Never expose `WEB_ADMIN_TOKEN`, `GEMINI_API_KEY`, Google refresh token, or Spark OAuth secrets.
+- The web UI stores `WEB_ADMIN_TOKEN` in browser localStorage on the device used to sign in.
+- Code writes create a backup Apps Script version first.
+- `SCRIPT_ACCESS_MODE=all` is powerful: the server can modify any Apps Script project available to the authorized Google account.
 
 ## Deploy
 
-1. Extract this ZIP.
-2. Upload/replace these files in the existing GitHub repository.
-3. Commit.
-4. Wait for Render auto-deploy.
-5. Open the root URL and confirm `version` is `4.3.0`.
-6. `/health` should still show both Google OAuth and Spark OAuth configured.
-7. In Gemini/Spark, disconnect/reconnect the custom app if the old tool schema is cached.
-
-## Example mobile prompts
-
-Read code:
-
-```text
-อ่าน Apps Script ปัจจุบันของฉัน แล้วสรุปว่าแต่ละไฟล์ทำอะไร ยังไม่ต้องแก้ไข
-```
-
-Update Code.gs:
-
-```text
-อ่าน Apps Script ปัจจุบันก่อน แล้วแก้ Code.gs ให้เพิ่มฟังก์ชันสรุปยอดรายวัน โดยเก็บโค้ดเดิมและฟังก์ชันเดิมทั้งหมดไว้ จากนั้นบอกว่าปรับอะไรไปบ้าง
-```
-
-Create/update HTML:
-
-```text
-แก้ Index.html ใน Apps Script ให้เพิ่มปุ่ม Refresh โดยห้ามลบส่วนเดิม และสำรองเวอร์ชันก่อนแก้
-```
+1. Upload all files in this package over the existing GitHub repository.
+2. Commit and let Render auto-deploy.
+3. Add `WEB_ADMIN_TOKEN` in Render Environment.
+4. Optional: add `GEMINI_API_KEY`.
+5. Confirm `/` returns version `4.5.0`.
+6. Open `/tool`.

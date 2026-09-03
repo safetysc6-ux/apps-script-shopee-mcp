@@ -14,11 +14,21 @@ export function scriptApi(){ return google.script({version:'v1',auth:oauthClient
 export function sheetsApi(){ return google.sheets({version:'v4',auth:oauthClient()}); }
 export function driveApi(){ return google.drive({version:'v3',auth:oauthClient()}); }
 
+function csvSet(v){ return new Set(String(v||'').split(',').map(x=>x.trim()).filter(Boolean)); }
+
+export function scriptAccessMode(){
+  return String(process.env.SCRIPT_ACCESS_MODE||'locked').trim().toLowerCase();
+}
 export function assertAllowedScript(id){
-  const a=(process.env.ALLOWED_SCRIPT_ID||'').trim();
-  if(a && id!==a) throw new Error('Script ID not allowed by server policy');
+  const mode=scriptAccessMode();
+  if(mode==='all') return;
+  const allowed=csvSet(process.env.ALLOWED_SCRIPT_IDS||process.env.ALLOWED_SCRIPT_ID||'');
+  if(allowed.size===0) throw new Error('No Apps Script project allowed. Set ALLOWED_SCRIPT_ID/ALLOWED_SCRIPT_IDS, or SCRIPT_ACCESS_MODE=all.');
+  if(!allowed.has(id)) throw new Error('Script ID not allowed by server policy');
 }
 export function assertAllowedSheet(id){
-  const a=(process.env.ALLOWED_SPREADSHEET_ID||'').trim();
-  if(a && id!==a) throw new Error('Spreadsheet ID not allowed by server policy');
+  const mode=String(process.env.SHEET_ACCESS_MODE||'locked').trim().toLowerCase();
+  if(mode==='all') return;
+  const allowed=csvSet(process.env.ALLOWED_SPREADSHEET_IDS||process.env.ALLOWED_SPREADSHEET_ID||'');
+  if(allowed.size && !allowed.has(id)) throw new Error('Spreadsheet ID not allowed by server policy');
 }
