@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
-import { randomUUID } from 'node:crypto';
+import crypto, { randomUUID } from 'node:crypto';
+import { SignJWT, jwtVerify } from 'jose';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
@@ -12,7 +13,10 @@ import {
 
 const app=express();
 app.use(express.json({limit:'16mb'}));
+app.use(express.urlencoded({extended:false}));
 const sessions=new Map();
+const authCodes=new Map();
+const BASE=(process.env.PUBLIC_BASE_URL||'').replace(/\/$/,'');
 
 const OAUTH_SCOPES=[
   'https://www.googleapis.com/auth/script.projects',
@@ -22,12 +26,78 @@ const OAUTH_SCOPES=[
   'https://www.googleapis.com/auth/drive.readonly'
 ];
 
-function requireBearer(req,res,next){
-  const expected=(process.env.MCP_BEARER_TOKEN||'').trim();
-  if(!expected) return next();
-  if((req.get('authorization')||'')!==`Bearer ${expected}`) return res.status(401).json({error:'Unauthorized'});
-  next();
+function signingKey(){
+  const s=(process.env.SPARK_TOKEN_SIGNING_SECRET||'');
+  if(s.length<32) throw new Error('SPARK_TOKEN_SIGNING_SECRET must be at least 32 characters');
+  return new TextEncoder().encode(s);
 }
+async function mintAccessToken(clientId){
+  return await new SignJWT({scope:'mcp'})
+    .setProtectedHeader({alg:'HS256'})
+    .setIssuer(BASE).setAudience(`${BASE}/mcp`).setSubject(clientId)
+    .setIssuedAt().setExpirationTime('1h').sign(signingKey());
+}
+async function validMcpBearer(req){
+  const h=req.get('authorization')||'';
+  if(!h.startsWith('Bearer ')) return false;
+  const token=h.slice(7);
+  const legacy=(process.env.MCP_BEARER_TOKEN||'').trim();
+  if(legacy && token===legacy) return true;
+  try{ await jwtVerify(token,signingKey(),{issuer:BASE,audience:`${BASE}/mcp`}); return true; }
+  catch{return false;}
+}
+async function requireMcpAuth(req,res,next){
+  if(await validMcpBearer(req)) return next();
+  const meta=`${BASE}/.well-known/oauth-protected-resource`;
+  res.set('WWW-Authenticate',`Bearer resource_metadata="${meta}"`);
+  return res.status(401).json({error:'unauthorized'});
+}
+function pkceS256(v){ return crypto.createHash('sha256').update(v).digest('base64url'); }
+function esc(v){ return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+// OAuth metadata for Spark / MCP clients
+app.get('/.well-known/oauth-protected-resource',(_req,res)=>res.json({
+  resource:`${BASE}/mcp`, authorization_servers:[BASE], bearer_methods_supported:['header'], scopes_supported:['mcp']
+}));
+app.get('/.well-known/oauth-authorization-server',(_req,res)=>res.json({
+  issuer:BASE,
+  authorization_endpoint:`${BASE}/oauth/authorize`,
+  token_endpoint:`${BASE}/oauth/token`,
+  response_types_supported:['code'], grant_types_supported:['authorization_code'],
+  token_endpoint_auth_methods_supported:['client_secret_post','client_secret_basic'],
+  code_challenge_methods_supported:['S256','plain'], scopes_supported:['mcp']
+}));
+
+app.get('/oauth/authorize',(req,res)=>{
+  const {response_type,client_id,redirect_uri,state,code_challenge,code_challenge_method,scope}=req.query;
+  if(response_type!=='code') return res.status(400).send('Unsupported response_type');
+  if(client_id!==process.env.SPARK_OAUTH_CLIENT_ID) return res.status(400).send('Unknown client_id');
+  if(redirect_uri!==process.env.SPARK_REDIRECT_URI) return res.status(400).send('redirect_uri mismatch');
+  const qs=new URLSearchParams({client_id:String(client_id),redirect_uri:String(redirect_uri),state:String(state||''),code_challenge:String(code_challenge||''),code_challenge_method:String(code_challenge_method||''),scope:String(scope||'mcp')}).toString();
+  res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:Arial;background:#f6f7f9}.card{max-width:560px;margin:70px auto;background:#fff;border:1px solid #ddd;border-radius:16px;padding:28px}.btn{padding:12px 18px;border:0;border-radius:10px;background:#111;color:#fff;font-weight:700;cursor:pointer}</style></head><body><div class="card"><h2>อนุญาต Spark เชื่อมต่อ MCP</h2><p>อนุญาตให้ Spark เรียกเครื่องมือ Apps Script, Google Sheets และ Shopee CSV ผ่าน MCP นี้</p><p>Client: ${esc(client_id)}</p><form method="post" action="/oauth/approve?${qs}"><button class="btn">อนุญาต</button></form></div></body></html>`);
+});
+app.post('/oauth/approve',(req,res)=>{
+  const {client_id,redirect_uri,state,code_challenge,code_challenge_method,scope}=req.query;
+  if(client_id!==process.env.SPARK_OAUTH_CLIENT_ID) return res.status(400).send('Unknown client_id');
+  if(redirect_uri!==process.env.SPARK_REDIRECT_URI) return res.status(400).send('redirect_uri mismatch');
+  const code=crypto.randomBytes(32).toString('base64url');
+  authCodes.set(code,{client_id,redirect_uri,code_challenge,code_challenge_method,scope:scope||'mcp',expires:Date.now()+300000});
+  const u=new URL(String(redirect_uri)); u.searchParams.set('code',code); if(state)u.searchParams.set('state',String(state)); res.redirect(u.toString());
+});
+app.post('/oauth/token',async(req,res)=>{
+  try{
+    let clientId=req.body.client_id||'', clientSecret=req.body.client_secret||'';
+    const basic=req.get('authorization')||'';
+    if(basic.startsWith('Basic ')){ const [u,p]=Buffer.from(basic.slice(6),'base64').toString('utf8').split(':'); clientId=u||clientId; clientSecret=p||clientSecret; }
+    if(clientId!==process.env.SPARK_OAUTH_CLIENT_ID || clientSecret!==process.env.SPARK_OAUTH_CLIENT_SECRET) return res.status(401).json({error:'invalid_client'});
+    if(req.body.grant_type!=='authorization_code') return res.status(400).json({error:'unsupported_grant_type'});
+    const rec=authCodes.get(req.body.code);
+    if(!rec || rec.expires<Date.now() || rec.client_id!==clientId || rec.redirect_uri!==req.body.redirect_uri) return res.status(400).json({error:'invalid_grant'});
+    if(rec.code_challenge){ const verifier=req.body.code_verifier||''; const actual=rec.code_challenge_method==='S256'?pkceS256(verifier):verifier; if(actual!==rec.code_challenge)return res.status(400).json({error:'invalid_grant',error_description:'PKCE verification failed'}); }
+    authCodes.delete(req.body.code);
+    res.json({access_token:await mintAccessToken(clientId),token_type:'Bearer',expires_in:3600,scope:'mcp'});
+  }catch(e){res.status(500).json({error:'server_error',error_description:String(e.message||e)});}
+});
 
 app.get('/auth/start',(_req,res)=>{
   const url=oauthClient().generateAuthUrl({access_type:'offline',prompt:'consent',scope:OAUTH_SCOPES});
@@ -48,12 +118,13 @@ app.get('/oauth2callback',async(req,res)=>{
 
 app.get('/health',async(_req,res)=>{
   try{
-    if(!process.env.GOOGLE_REFRESH_TOKEN) return res.json({ok:false,oauthConfigured:false});
+    const sparkReady=!!(BASE&&process.env.SPARK_OAUTH_CLIENT_ID&&process.env.SPARK_OAUTH_CLIENT_SECRET&&process.env.SPARK_REDIRECT_URI&&process.env.SPARK_TOKEN_SIGNING_SECRET);
+    if(!process.env.GOOGLE_REFRESH_TOKEN) return res.json({ok:false,googleOauthConfigured:false,sparkOauthConfigured:sparkReady});
     const t=await oauthClient().getAccessToken();
-    res.json({ok:!!t.token,oauthConfigured:true});
+    res.json({ok:!!t.token,googleOauthConfigured:true,sparkOauthConfigured:sparkReady});
   }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
 });
-app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'3.0.0'}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.0.0',sparkOAuth:true}));
 
 function parseCommission(data,targetDate){
   const h=data.headers;
@@ -354,7 +425,7 @@ function makeServer(){
   return server;
 }
 
-app.post('/mcp',requireBearer,async(req,res)=>{
+app.post('/mcp',requireMcpAuth,async(req,res)=>{
   try{
     const sid=req.get('mcp-session-id');
     let t=sid?sessions.get(sid):null;

@@ -1,45 +1,27 @@
-# Apps Script + Sheets + Shopee CSV MCP v3
+# Apps Script + Sheets + Shopee MCP v4 — Spark OAuth
 
-เวอร์ชันนี้เพิ่ม Shopee CSV โดยตรง
+เพิ่ม OAuth สำหรับ **Spark → MCP** แยกจาก Google OAuth เดิม
 
-## Tool ใหม่
-- `drive_read_csv`
-- `shopee_find_latest_reports`
-- `shopee_parse_commission_csv`
-- `shopee_parse_click_csv`
-- `shopee_refresh_daily_report`
+## Render Environment ใหม่
+```env
+PUBLIC_BASE_URL=https://apps-script-shopee-mcp.onrender.com
+SPARK_OAUTH_CLIENT_ID=ตั้งเอง เช่น spark-mcp-client
+SPARK_OAUTH_CLIENT_SECRET=สุ่มยาวๆ
+SPARK_REDIRECT_URI=คัดลอก URL การเปลี่ยนเส้นทางจาก Spark มาใส่ตรงนี้
+SPARK_TOKEN_SIGNING_SECRET=สุ่มยาวอย่างน้อย 32 ตัวอักษร
+```
 
-## Flow ที่ทำได้
-Shopee CSV -> Google Drive -> MCP -> Parse -> KPI -> Google Sheet -> Apps Script/Web Dashboard
+> `SPARK_OAUTH_CLIENT_ID/SECRET` ไม่ใช่ Google OAuth Client ID/Secret
 
-ตัวอย่างคำสั่งกับ AI:
-- "หาไฟล์ Shopee ล่าสุดในโฟลเดอร์แล้วสรุปวันที่ 28"
-- "อ่าน WebsiteClickReport วันที่ 28 และหา Top SubID"
-- "อ่าน Commission วันที่ 28 แยก Direct/Indirect/D0/Cookie"
-- "อัปเดต Daily Report วันที่ 28 จากไฟล์ล่าสุดให้เลย"
+## ในหน้า Spark
+- MCP URL: `https://apps-script-shopee-mcp.onrender.com/mcp`
+- OAuth Client ID: ค่า `SPARK_OAUTH_CLIENT_ID`
+- OAuth Client Secret: ค่า `SPARK_OAUTH_CLIENT_SECRET`
+- กด “คัดลอก URL การเปลี่ยนเส้นทาง” แล้วนำไปใส่ Render เป็น `SPARK_REDIRECT_URI`
 
-## Render Environment ที่แนะนำ
-GOOGLE_CLIENT_ID
-GOOGLE_CLIENT_SECRET
-GOOGLE_REDIRECT_URI=https://YOUR-SERVICE.onrender.com/oauth2callback
-GOOGLE_REFRESH_TOKEN
-ALLOWED_SCRIPT_ID
-ALLOWED_SPREADSHEET_ID
-SHOPEE_FOLDER_ID
-REPORT_SPREADSHEET_ID
-REPORT_DAILY_SHEET=Daily Report
-MCP_BEARER_TOKEN
-PORT=10000
+จากนั้น Save/Redeploy Render แล้วเชื่อมใหม่
 
-## OAuth scopes
-- script.projects
-- script.deployments
-- script.processes
-- spreadsheets
-- drive.readonly
+## Health
+`https://apps-script-shopee-mcp.onrender.com/health` ควรเห็น `googleOauthConfigured:true` และ `sparkOauthConfigured:true`
 
-## หมายเหตุ CSV
-- รองรับ UTF-8/BOM
-- รองรับหัวคอลัมน์ไทย/อังกฤษที่พบบ่อย
-- normalize Sub ID ที่ลงท้ายด้วย ----
-- รองรับไฟล์ขนาดหลาย MB โดยดาวน์โหลดจาก Drive แล้ว parse ฝั่ง server
+Google OAuth เดิม (`/auth/start`, `/oauth2callback`) ยังคงใช้สำหรับ MCP → Google API เหมือนเดิม
