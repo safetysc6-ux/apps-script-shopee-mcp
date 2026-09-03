@@ -1,3 +1,14 @@
+# v4.2 Spark OAuth Debug Fix
+
+Changes:
+- Fixes missing `mintRefreshToken()` that could make `/oauth/token` return HTTP 500 after consent.
+- Adds safe HTTP/OAuth/MCP request logging for Render Logs.
+- Logs only route/status and boolean checks; it does **not** print bearer tokens, client secrets, authorization codes, refresh tokens, or query values.
+
+After deploy, retry the Spark connection and inspect Render Logs for `[OAUTH ...]`, `[MCP AUTH]`, and `[HTTP]` lines.
+
+---
+
 # Apps Script + Sheets + Shopee MCP v4 — Spark OAuth
 
 เพิ่ม OAuth สำหรับ **Spark → MCP** แยกจาก Google OAuth เดิม

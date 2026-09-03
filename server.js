@@ -14,6 +14,22 @@ import {
 const app=express();
 app.use(express.json({limit:'16mb'}));
 app.use(express.urlencoded({extended:false}));
+
+// Safe request logger: never prints Authorization headers, tokens, secrets, codes, or query values.
+app.use((req,res,next)=>{
+  const started=Date.now();
+  const queryKeys=Object.keys(req.query||{});
+  const bodyKeys=(req.body && typeof req.body==='object')?Object.keys(req.body):[];
+  res.on('finish',()=>{
+    const extra=[];
+    if(queryKeys.length) extra.push(`queryKeys=${queryKeys.join(',')}`);
+    if(bodyKeys.length) extra.push(`bodyKeys=${bodyKeys.join(',')}`);
+    if(req.get('mcp-session-id')) extra.push('mcpSession=present');
+    console.log(`[HTTP] ${req.method} ${req.path} -> ${res.statusCode} (${Date.now()-started}ms)${extra.length?' | '+extra.join(' | '):''}`);
+  });
+  next();
+});
+
 const sessions=new Map();
 const authCodes=new Map();
 const BASE=(process.env.PUBLIC_BASE_URL||'').replace(/\/$/,'');
@@ -37,6 +53,12 @@ async function mintAccessToken(clientId){
     .setIssuer(BASE).setAudience(`${BASE}/mcp`).setSubject(clientId)
     .setIssuedAt().setExpirationTime('1h').sign(signingKey());
 }
+async function mintRefreshToken(clientId){
+  return await new SignJWT({typ:'refresh_token',scope:'mcp'})
+    .setProtectedHeader({alg:'HS256'})
+    .setIssuer(BASE).setAudience(`${BASE}/oauth/token`).setSubject(clientId)
+    .setIssuedAt().setExpirationTime('30d').sign(signingKey());
+}
 async function validMcpBearer(req){
   const h=req.get('authorization')||'';
   if(!h.startsWith('Bearer ')) return false;
@@ -47,7 +69,9 @@ async function validMcpBearer(req){
   catch{return false;}
 }
 async function requireMcpAuth(req,res,next){
-  if(await validMcpBearer(req)) return next();
+  const ok=await validMcpBearer(req);
+  console.log(`[MCP AUTH] authorized=${ok} method=${req.method} session=${req.get('mcp-session-id')?'present':'none'}`);
+  if(ok) return next();
   const meta=`${BASE}/.well-known/oauth-protected-resource`;
   res.set('WWW-Authenticate',`Bearer resource_metadata="${meta}"`);
   return res.status(401).json({error:'unauthorized'});
@@ -70,6 +94,7 @@ app.get('/.well-known/oauth-authorization-server',(_req,res)=>res.json({
 
 app.get('/oauth/authorize',(req,res)=>{
   const {response_type,client_id,redirect_uri,state,code_challenge,code_challenge_method,scope}=req.query;
+  console.log(`[OAUTH authorize] response_type=${response_type||'none'} clientMatch=${client_id===process.env.SPARK_OAUTH_CLIENT_ID} redirectMatch=${redirect_uri===process.env.SPARK_REDIRECT_URI} pkce=${code_challenge?'yes':'no'} method=${code_challenge_method||'none'} state=${state?'yes':'no'}`);
   if(response_type!=='code') return res.status(400).send('Unsupported response_type');
   if(client_id!==process.env.SPARK_OAUTH_CLIENT_ID) return res.status(400).send('Unknown client_id');
   if(redirect_uri!==process.env.SPARK_REDIRECT_URI) return res.status(400).send('redirect_uri mismatch');
@@ -78,6 +103,7 @@ app.get('/oauth/authorize',(req,res)=>{
 });
 app.post('/oauth/approve',(req,res)=>{
   const {client_id,redirect_uri,state,code_challenge,code_challenge_method,scope}=req.query;
+  console.log(`[OAUTH approve] clientMatch=${client_id===process.env.SPARK_OAUTH_CLIENT_ID} redirectMatch=${redirect_uri===process.env.SPARK_REDIRECT_URI} pkce=${code_challenge?'yes':'no'} method=${code_challenge_method||'none'} state=${state?'yes':'no'}`);
   if(client_id!==process.env.SPARK_OAUTH_CLIENT_ID) return res.status(400).send('Unknown client_id');
   if(redirect_uri!==process.env.SPARK_REDIRECT_URI) return res.status(400).send('redirect_uri mismatch');
   const code=crypto.randomBytes(32).toString('base64url');
@@ -89,7 +115,10 @@ app.post('/oauth/token',async(req,res)=>{
     let clientId=req.body.client_id||'', clientSecret=req.body.client_secret||'';
     const basic=req.get('authorization')||'';
     if(basic.startsWith('Basic ')){ const [u,p]=Buffer.from(basic.slice(6),'base64').toString('utf8').split(':'); clientId=u||clientId; clientSecret=p||clientSecret; }
-    if(clientId!==process.env.SPARK_OAUTH_CLIENT_ID || clientSecret!==process.env.SPARK_OAUTH_CLIENT_SECRET) return res.status(401).json({error:'invalid_client'});
+    const clientMatch=clientId===process.env.SPARK_OAUTH_CLIENT_ID;
+    const secretMatch=clientSecret===process.env.SPARK_OAUTH_CLIENT_SECRET;
+    console.log(`[OAUTH token] grant_type=${req.body.grant_type||'none'} auth=${basic.startsWith('Basic ')?'basic':'post-or-none'} clientMatch=${clientMatch} secretMatch=${secretMatch} redirectProvided=${req.body.redirect_uri?'yes':'no'} verifier=${req.body.code_verifier?'yes':'no'}`);
+    if(!clientMatch || !secretMatch) return res.status(401).json({error:'invalid_client'});
 
     if(req.body.grant_type==='refresh_token'){
       try{
@@ -134,7 +163,7 @@ app.get('/health',async(_req,res)=>{
     res.json({ok:!!t.token,googleOauthConfigured:true,sparkOauthConfigured:sparkReady});
   }catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}
 });
-app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.1.0',sparkOAuth:true}));
+app.get('/',(_req,res)=>res.json({ok:true,service:'apps-script-sheets-shopee-mcp',version:'4.2.0',sparkOAuth:true}));
 
 function parseCommission(data,targetDate){
   const h=data.headers;
@@ -285,7 +314,7 @@ async function upsertDaily(spreadsheetId,sheetName,obj){
 }
 
 function makeServer(){
-  const server=new McpServer({name:'google-apps-script-sheets-shopee-manager',version:'3.0.0'});
+  const server=new McpServer({name:'google-apps-script-sheets-shopee-manager',version:'4.2.0'});
 
   // --- Existing Apps Script / Sheets / Drive basics ---
   server.registerTool('apps_script_get_content',{
